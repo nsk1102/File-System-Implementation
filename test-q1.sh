@@ -36,8 +36,8 @@ test_summary(){
 }
 
 # ----  this is a test ----------------
-testnum=1
-echo 'Test 1 - simple passing test'
+testnum=0
+echo 'Test 0 - simple passing test'
 test_equal 0 0 'this better not fail'
 test_summary
 # ----  test is finished --------------
@@ -50,6 +50,8 @@ test_summary
 
 # data for tests - see description
 
+testnum=1
+echo 'Test 1 - ls test'
 test1dat=('/file.A -rwxrwxrwx 1000 1342177480' \
 	      '/file.7 -rwxrwxrwx 6644 1342177580' \
 	      '/dir1 drwxr-xr-x 1024 1342177680' \
@@ -61,8 +63,15 @@ for line in "${test1dat[@]}"; do
     set $line
     path=$1; mode=$2; len=$3; time=$4
     echo path=$path mode=$mode len=$len time=$time
+    set -- $(ls -l -d --time-style=+%s $DIR$path)
+    test_equal $mode $1 'mode not equal'
+    test_equal $len $5 'len not equal'
+    test_equal $time $6 'mode not equal'
 done
+test_summary
 
+testnum=2
+echo 'Test 2 - cat test'
 test2dat=('/file.A 3509208153 1000' \
 	      '/file.7 94780536 6644' \
 	      '/dir1/file.0 4294967295 0' \
@@ -73,22 +82,52 @@ for line in "${test2dat[@]}"; do
     set $line
     path=$1; cksum=$2.$3
     echo path=$path cksum=$cksum
+    set -- $(cat $DIR$path | cksum)
+    test_equal $cksum $1.$2 'mode not equal'
 done
+test_summary
 
 # because of the way the FUSE framework works, you don't get proper
 # error codes out of commands, so just check that 'ls' on these fails
+testnum=3
+echo 'Test 3 - dd test'
+for line in "${test2dat[@]}"; do
+    set $line
+    path=$1; cksum=$2.$3
+    echo path=$path cksum=$cksum
+    set -- $(dd if=$DIR$path status=none bs=17 | cksum)
+    test_equal $cksum $1.$2 'mode not equal'
+done
+test_summary
 
+testnum=4
+echo 'Test 4 - ls fail test'
 test3dat=("/not-a-file" "/dir1/not-a-file" "/not-a-dir/file.0" \
-	      "/file.A/file.0" "/dir1/file.0/testing")
+          "/file.A/file.0" "/dir1/file.0/testing")
 for path in "${test3dat[@]}"; do
     echo path=$path
+    echo $(ls -l -d --time-style=+%s $DIR$path)
 done
+test_summary
 
 # last test -
 #   read a directory (with 'cat')
 #   list a file ('ls file/')
+testnum=5
+echo 'Test 5 - read a directory'
+test4dat=("/" "/dir1")
+for path in "${test4dat[@]}"; do
+    echo path=$path
+    echo $(cat $DIR$path)
+done
+test_summary
 
-
-
-
-
+testnum=6
+echo 'Test 6 - list a file'
+test5dat=("/file.A" "/file.7" "/dir1/file.2")
+for path in "${test5dat[@]}"; do
+    echo path=$path
+    set -- $(ls $DIR$path)
+    test_equal $DIR$path $1 'result not equal'
+done
+test_summary
