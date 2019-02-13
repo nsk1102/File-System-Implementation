@@ -1,0 +1,233 @@
+#!/usr/bin/python3
+#
+# file:        fsck.hw3
+# description: File system checker for hw3 image
+#
+import sys
+import os
+import struct
+
+class dirent:
+    size = 32
+    def __init__(self):
+        self.fmt = '@ I 28s'
+
+    def pack(self, valid, isdir, inode, name):
+        v = 1 if valid else 0;
+        d = 2 if isdir else 0;
+        flags = v | d | (inode << 2)
+        self.data = struct.pack(self.fmt, flags, bytes(name, 'UTF-8'))
+
+    def unpack(self, data):
+        v,name = struct.unpack(self.fmt, data)
+        self.valid = ((v & 1) != 0)
+        self.isdir = ((v & 2) != 0)
+        self.inode = (v >> 2)
+        self.name = ''
+        if self.valid:
+            self.name = str(name, 'UTF-8').rstrip('\0')
+
+class super:
+    def __init__(self):
+        self.fmt = '@ I I I I I I 1000x'
+
+    def pack(self, i_mapsz, i_sz, b_mapsz, blocks):
+        self.data = struct.pack(self.fmt, 0x37363030, i_mapsz, i_sz,
+                                    b_mapsz, blocks, 1)
+
+    def unpack(self, data):
+        (magic, self.inode_map_sz, self.inode_region_sz, self.block_map_sz,
+             self.num_blocks, self.root_inode) = struct.unpack(self.fmt, data)
+        assert magic == 0x37363030
+
+class inode:
+    size = 64
+    def __init__(self):
+        self.fmt = '@ H H I I I I 6I I I 12x'
+
+    def pack(self, uid, gid, mode, ctime, mtime, size, direct, indir1, indir2):
+        self.data = struct.pack(self.fmt, uid, gid, mode, ctime, mtime, size,
+                                    direct, indir1, indir2)
+
+    def unpack(self, data):
+        f = struct.unpack(self.fmt, data)
+        self.uid, self.gid, self.mode, self.ctime, self.mtime, self.size = f[0:6]
+        self.direct = f[6:12]
+        self.indir_1, self.indir_2 = f[12:14]
+
+def inode_data(num):
+    offset = num * inode.size
+    return inodes[offset:offset+inode.size]
+
+def read_inode(num):
+    i = inode()
+    i.unpack(inode_data(num))
+    return i
+
+def read_dirent(data):
+    d = dirent()
+    d.unpack(data)
+    return d
+
+def dirents(block):
+    return [read_dirent(block[i:i+dirent.size]) for i in range(0, len(block), dirent.size)]
+    
+def test_bit(map, i):
+    j = map[i//8]
+    return (j & (1 << (i%8))) != 0
+
+def get_ptrs(blk):
+    p = struct.unpack('@ 256I', os.pread(fd, 1024, 1024*blk))
+    return [i for i in filter(None, p)]
+
+def read_indir(blk):
+    data = b''
+    for i in get_ptrs(blk):
+        if i == 0:
+            break;
+        data = data + os.pread(fd, 1024, 1024*i)
+    return data
+
+def file_data(inode):
+    data = b''
+    for i in range(6):
+        if inode.direct[i] == 0:
+            break
+        data = data + os.pread(fd, 1024, 1024*inode.direct[i])
+    if inode.indir_1 != 0:
+        data = data + read_indir(inode.indir_1)
+        
+    if inode.indir_2 != 0:
+        for i in get_ptrs(inode.indir_2):
+            if i == 0:
+                break
+            data = data + read_indir(i)
+    return data[0:inode.size]
+
+def file_blocks(inode):
+    blks = [i for i in filter(None, inode.direct)]
+    if inode.indir_1:
+        blks.append(inode.indir_1)
+        blks = blks + get_ptrs(inode.indir_1)
+    if inode.indir_2:
+        blks.append(inode.indir_2)
+        indirs = get_ptrs(inode.indir_2)
+        blks = blks + indirs
+        for blk in indirs:
+            blks = blks + get_ptrs(blk)
+    return [b for b in blks]
+
+if len(sys.argv) != 2:
+    print('usage: fsck.hw3 <image>')
+    sys.exit(1)
+
+try:
+    fd = os.open(sys.argv[1], os.O_RDONLY)
+except OSError as e:
+    print(e)
+    sys.exit(1)
+
+sb = super()
+sb.unpack(os.pread(fd, 1024, 0))
+
+statbuf = os.fstat(fd)
+if statbuf.st_size != 1024 * sb.num_blocks:
+    fail('ERROR: num_blocks %d, file size %d' %
+             (sb.num_blocks, statbuf.st_size))
+
+imap_start = 1024
+imap_len = sb.inode_map_sz * 1024
+bmap_start = imap_start + imap_len
+bmap_len = sb.block_map_sz * 1024
+i_start = bmap_start + bmap_len
+i_len = sb.inode_region_sz * 1024
+first_data_block = 1 + sb.inode_map_sz + sb.block_map_sz + sb.inode_region_sz
+
+# remember, pread takes length THEN offset
+#
+imap = os.pread(fd, imap_len, imap_start)
+inodes = os.pread(fd, i_len, i_start)
+bmap = os.pread(fd, bmap_len, bmap_start)
+
+S_IFMT  = 0o0170000  # bit mask for the file type bit field
+S_IFREG = 0o0100000  # regular file
+S_IFDIR = 0o0040000  # directory
+
+found_inodes = set()
+found_blocks = dict()
+
+failures = []
+def fail(msg):
+    print(msg)
+    failures.append(msg)
+
+# the primary verification function. (I should call it dir_recurse,
+# I guess, since it recurses instead of iterating)
+#
+def dir_iter(path, inum):
+    i = read_inode(inum)
+    assert (i.mode & S_IFMT) == S_IFDIR
+    data = file_data(i)
+    if len(data) < 1024 or (len(data) % 1024) != 0:
+        fail('ERROR: bad directory length %s' % len(data))
+    dd = dirents(data)
+
+    for d in dd:
+        if d.valid:
+            name = path + d.name
+            print('d' if d.isdir else 'f', name, d.inode)
+
+            # every inode is marked in the bitmap and
+            # not already seen
+            j = d.inode
+            if not test_bit(imap, j):
+                fail('ERROR: inode %d marked free' % j)
+            if j in found_inodes:
+                fail('ERROR: inode %d used twice' % j)
+            found_inodes.add(j)
+
+            bb = file_blocks(read_inode(d.inode))
+            print(' blocks:', bb)
+            for b in bb:
+                if not test_bit(bmap, b):
+                    fail('ERROR: block %d marked free' % b)
+                if b in found_blocks:
+                    fail('ERROR: %s: block %d previously used in %s' %
+                              (name, b, found_blocks[b]))
+                if b < first_data_block:
+                    fail('ERROR: %s: invalid block %d (too low)' % (name, b))
+                found_blocks[b] = (path + d.name)
+            if (d.isdir):
+                dir_iter((path + d.name + '/'), d.inode)
+
+# kludge - add info for root directory
+#
+found_inodes.add(1)
+for b in file_blocks(read_inode(1)):
+    found_blocks[b] = '/'
+
+# traverse the file system
+#
+dir_iter('/', 1)
+
+# and now check that the blocks/inodes seen correspond to the bitmaps
+#
+for i in range(first_data_block):
+    if not test_bit(bmap, i):
+        fail('ERROR: block %d should be marked in-use' % i)
+
+for i in range(first_data_block, first_data_block + sb.num_blocks):
+    if test_bit(bmap, i) and not i in found_blocks:
+        fail('ERROR: block %d marked used but not found' % i)
+
+for i in range(1, i_len // inode.size):
+    if test_bit(imap, i) and not i in found_inodes:
+        fail('ERROR: inode %d marked used but not found' % i)
+
+if not failures:
+    print('DISK FORMAT OK')
+else:
+    print('TESTS FAILED:')
+    for l in failures:
+        print(l)
+    sys.exit(1)
